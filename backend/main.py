@@ -15,7 +15,7 @@ load_dotenv()
 
 app = FastAPI(
     title="Smart Water Bottle API",
-    description="AI-powered hydration monitoring system",
+    description="AI and IoT powered hydration monitoring system",
     version="1.0.0"
 )
 
