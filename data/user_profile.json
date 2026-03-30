@@ -1,0 +1,10 @@
+{
+  "user_id": "U01",
+  "age": 21,
+  "gender": "male",
+  "weight": 70,
+  "height": 175,
+  "activity_level": "moderate",
+  "goal": "fitness",
+  "bmi": 22.86
+}
