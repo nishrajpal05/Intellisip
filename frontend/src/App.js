@@ -11,6 +11,13 @@ import {
 } from 'recharts';
 import './App.css';
 
+
+import PersonalizedInsights from './components/PersonalizedInsights';
+import ReminderCard from './components/ReminderCard';
+
+
+
+
 const API_BASE = 'http://localhost:8000/api';
 
 function App() {
