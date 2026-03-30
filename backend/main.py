@@ -13,22 +13,27 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# ============================================
+# FASTAPI APP INITIALIZATION
+# ============================================
 app = FastAPI(
     title="Smart Water Bottle API",
-    description="AI and IoT powered hydration monitoring system",
+    description="AI-powered hydration monitoring system",
     version="1.0.0"
 )
 
-
+# Enable CORS (so frontend can talk to backend)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # In production, specify exact frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
+# ============================================
+# MONGODB CONNECTION
+# ============================================
 MONGODB_URL = os.getenv("MONGODB_URL")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "water_bottle_db")
 
@@ -36,24 +41,42 @@ try:
     client = MongoClient(MONGODB_URL)
     db = client[DATABASE_NAME]
     hydration_collection = db["hydration_data"]
-    print(" Connected to MongoDB successfully!")
+    print("✅ Connected to MongoDB successfully!")
 except Exception as e:
-    print(f" MongoDB connection failed: {e}")
+    print(f"❌ MongoDB connection failed: {e}")
     db = None
 
-#ml models ko load 
+# ============================================
+# LOAD ML MODELS
+# ============================================
 try:
     # Load models from the models folder
     prediction_model = joblib.load("../models/prediction_model.pkl")
     anomaly_model = joblib.load("../models/anomaly_model.pkl")
-    print(" ML models loaded successfully!")
+    print("✅ ML models loaded successfully!")
 except Exception as e:
-    print(f" Model loading failed: {e}")
+    print(f"❌ Model loading failed: {e}")
     print("Make sure prediction_model.pkl and anomaly_model.pkl are in ../models/")
     prediction_model = None
     anomaly_model = None
 
+# ============================================
+# INITIALIZE SMART SERVICES
+# ============================================
+from notification_service import NotificationService
+from ml_insights import MLInsightsEngine
 
+notification_service = None
+ml_insights = None
+
+if db is not None:
+    notification_service = NotificationService(hydration_collection)
+    ml_insights = MLInsightsEngine(hydration_collection)
+    print("✅ Smart services initialized!")
+
+# ============================================
+# PYDANTIC MODELS (DATA SCHEMAS)
+# ============================================
 class SipData(BaseModel):
     """Data structure for a single sip from ESP32"""
     user_id: str = "user1"
@@ -87,20 +110,39 @@ class AnomalyAlert(BaseModel):
     severity: str
     message: str
 
+# ============================================
+# API ENDPOINTS
+# ============================================
 
 @app.get("/")
 async def root():
     """Health check endpoint"""
+    db_status = "disconnected"
+    db_error = None
+    
+    if db is not None:
+        try:
+            # Test connection by pinging
+            client.admin.command('ping')
+            db_status = "connected"
+        except Exception as e:
+            db_status = "error"
+            db_error = str(e)
+    
     return {
         "status": "running",
         "service": "Smart Water Bottle API",
         "models_loaded": prediction_model is not None and anomaly_model is not None,
-        "database_connected": db is not None
+        "database_status": db_status,
+        "database_error": db_error
     }
 
 @app.post("/api/ingest-sip")
 async def ingest_sip(sip: SipData):
-   
+    """
+    Receive sip data from ESP32 and store in MongoDB
+    This is what ESP32 will call when water is consumed
+    """
     if db is None:
         raise HTTPException(status_code=500, detail="Database not connected")
     
@@ -145,7 +187,10 @@ async def ingest_sip(sip: SipData):
 
 @app.get("/api/daily-intake", response_model=List[DailyIntake])
 async def get_daily_intake(user_id: str = "user1", days: int = 7):
-   
+    """
+    Get daily hydration summary for the past N days
+    Used by frontend for daily intake chart
+    """
     if db is None:
         raise HTTPException(status_code=500, detail="Database not connected")
     
@@ -182,7 +227,10 @@ async def get_daily_intake(user_id: str = "user1", days: int = 7):
 
 @app.post("/api/predict-next-intake")
 async def predict_next_intake(request: PredictionRequest):
-   
+    """
+    Predict next hour's water intake using ML model
+    Frontend calls this to show predictions
+    """
     if prediction_model is None:
         raise HTTPException(status_code=500, detail="Prediction model not loaded")
     
@@ -211,7 +259,10 @@ async def predict_next_intake(request: PredictionRequest):
 
 @app.get("/api/anomaly-alerts", response_model=List[AnomalyAlert])
 async def get_anomaly_alerts(user_id: str = "user1", days: int = 7):
-   
+    """
+    Detect anomalies in recent hydration data
+    Frontend displays these as health alerts
+    """
     if anomaly_model is None or db is None:
         raise HTTPException(status_code=500, detail="Anomaly model or database not available")
     
@@ -276,7 +327,10 @@ async def get_anomaly_alerts(user_id: str = "user1", days: int = 7):
 
 @app.get("/api/hourly-breakdown")
 async def get_hourly_breakdown(user_id: str = "user1", day: Optional[int] = None):
-    
+    """
+    Get hourly breakdown of water intake for a specific day
+    Used for time-series visualization
+    """
     if db is None:
         raise HTTPException(status_code=500, detail="Database not connected")
     
@@ -321,7 +375,10 @@ async def get_hourly_breakdown(user_id: str = "user1", day: Optional[int] = None
 
 @app.post("/api/load-synthetic-data")
 async def load_synthetic_data():
-  
+    """
+    Load synthetic data from CSV into MongoDB
+    Run this once to populate database with test data
+    """
     if db is None:
         raise HTTPException(status_code=500, detail="Database not connected")
     
@@ -345,10 +402,94 @@ async def load_synthetic_data():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error loading data: {str(e)}")
 
+# ============================================
+# NEW ENDPOINTS - SMART REMINDERS
+# ============================================
 
+@app.get("/api/notifications/check")
+async def check_notifications(user_id: str = "user1", temperature: float = 25):
+    """
+    Check for pending notifications/reminders
+    Frontend calls this periodically
+    """
+    if notification_service is None:
+        raise HTTPException(status_code=500, detail="Notification service not available")
+    
+    try:
+        notifications = notification_service.get_all_pending_notifications(user_id, temperature)
+        return {
+            "count": len(notifications),
+            "notifications": notifications
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error checking notifications: {str(e)}")
+
+@app.get("/api/notifications/hydration-status")
+async def get_hydration_status(user_id: str = "user1"):
+    """
+    Get current hydration status and any warnings
+    """
+    if notification_service is None:
+        raise HTTPException(status_code=500, detail="Notification service not available")
+    
+    try:
+        status = notification_service.check_hydration_status(user_id)
+        return status if status else {"status": "good", "message": "Hydration on track!"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+# ============================================
+# NEW ENDPOINTS - ML PERSONALIZATION
+# ============================================
+
+@app.get("/api/insights/weekly-report")
+async def get_weekly_report(user_id: str = "user1"):
+    """
+    Generate comprehensive weekly hydration report
+    """
+    if ml_insights is None:
+        raise HTTPException(status_code=500, detail="ML insights service not available")
+    
+    try:
+        report = ml_insights.generate_weekly_report(user_id)
+        return report
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating report: {str(e)}")
+
+@app.get("/api/insights/personality")
+async def get_drinking_personality(user_id: str = "user1"):
+    """
+    Analyze user's drinking personality/habits
+    """
+    if ml_insights is None:
+        raise HTTPException(status_code=500, detail="ML insights service not available")
+    
+    try:
+        personality = ml_insights.get_drinking_personality(user_id)
+        return personality
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/api/insights/today-prediction")
+async def predict_today(user_id: str = "user1"):
+    """
+    Predict if user will hit goal today
+    """
+    if ml_insights is None:
+        raise HTTPException(status_code=500, detail="ML insights service not available")
+    
+    try:
+        prediction = ml_insights.predict_today_completion(user_id)
+        return prediction
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+# ============================================
+# RUN SERVER
+# ============================================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     print(f"\n Starting server on http://localhost:{port}")
-    print(f" API docs available at http://localhost:{port}/docs")
+    print(f"API docs available at http://localhost:{port}/docs")
     uvicorn.run(app, host="0.0.0.0", port=port)
